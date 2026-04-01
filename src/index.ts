@@ -46,12 +46,20 @@ type MatchPlayer = {
   ws?: PlayerSocket;
 };
 
+type TableCard = {
+  seat: string;
+  card: Card;
+};
+
 type MatchState = {
   matchId: string;
   players: MatchPlayer[];
   hands: Record<string, Card[]>;
-  tableCards: Array<{ seat: string; card: Card }>;
+  tableCards: TableCard[];
+  currentTurn: string;
 };
+
+const TURN_ORDER = ["N", "E", "S", "W"] as const;
 
 const server = http.createServer((req, res) => {
   if (req.url === "/") {
@@ -257,6 +265,12 @@ function cardsEqual(a?: Card, b?: Card) {
   return !!a && !!b && a.suit === b.suit && a.rank === b.rank;
 }
 
+function nextSeat(seat: string) {
+  const index = TURN_ORDER.indexOf(seat as (typeof TURN_ORDER)[number]);
+  if (index === -1) return "N";
+  return TURN_ORDER[(index + 1) % TURN_ORDER.length];
+}
+
 function createMatch(players: PlayerSocket[]) {
   const matchId = makeId("match");
   const humans = buildHumans(players);
@@ -268,6 +282,7 @@ function createMatch(players: PlayerSocket[]) {
     players: allPlayers,
     hands,
     tableCards: [],
+    currentTurn: "N",
   };
 
   matches.set(matchId, match);
@@ -292,6 +307,7 @@ function createMatch(players: PlayerSocket[]) {
           teamCode: p.teamCode ?? "",
         })),
         hasBots: allPlayers.some((p) => p.isBot),
+        currentTurn: match.currentTurn,
       },
     });
 
@@ -301,8 +317,17 @@ function createMatch(players: PlayerSocket[]) {
         matchId,
         seat: thisPlayer?.seat ?? "N",
         hand: hands[player.playerId ?? ""],
+        currentTurn: match.currentTurn,
       },
     });
+  });
+
+  broadcastToMatch(match, {
+    t: "TURN_UPDATE",
+    d: {
+      matchId,
+      currentTurn: match.currentTurn,
+    },
   });
 
   console.log(
@@ -444,6 +469,14 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        if (seat !== match.currentTurn) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Not your turn" },
+          });
+          return;
+        }
+
         const matchPlayer = match.players.find(
           (p) => p.playerId === player.playerId && p.seat === seat,
         );
@@ -459,7 +492,7 @@ wss.on("connection", (ws) => {
         const hand = match.hands[player.playerId ?? ""] ?? [];
         const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
 
-        if (cardIndex === -1) {
+        if (cardIndex == -1) {
           send(player, {
             t: "ERROR",
             d: { message: "Card not in hand" },
@@ -474,6 +507,10 @@ wss.on("connection", (ws) => {
           card: playedCard,
         });
 
+        if (match.tableCards.length < 4) {
+          match.currentTurn = nextSeat(seat);
+        }
+
         broadcastToMatch(match, {
           t: "CARD_PLAYED",
           d: {
@@ -482,8 +519,39 @@ wss.on("connection", (ws) => {
             card: playedCard,
             remainingCount: hand.length,
             tableCards: match.tableCards,
+            currentTurn: match.currentTurn,
           },
         });
+
+        if (match.tableCards.length === 4) {
+          const finishedTrick = [...match.tableCards];
+
+          broadcastToMatch(match, {
+            t: "TRICK_COMPLETE",
+            d: {
+              matchId,
+              tableCards: finishedTrick,
+            },
+          });
+
+          match.tableCards = [];
+          match.currentTurn = "N";
+
+          broadcastToMatch(match, {
+            t: "TURN_UPDATE",
+            d: {
+              matchId,
+              currentTurn: match.currentTurn,
+            },
+          });
+
+          broadcastToMatch(match, {
+            t: "TABLE_CLEAR",
+            d: {
+              matchId,
+            },
+          });
+        }
 
         return;
       }
