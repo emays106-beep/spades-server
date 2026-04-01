@@ -11,6 +11,14 @@ type PlayerSocket = WebSocket & {
   guestName?: string;
   inQueue?: boolean;
   matchId?: string;
+  queueTimer?: NodeJS.Timeout | null;
+};
+
+type MatchPlayer = {
+  seat: string;
+  name: string;
+  playerId: string;
+  isBot: boolean;
 };
 
 const server = http.createServer((req, res) => {
@@ -38,49 +46,108 @@ function send(ws: PlayerSocket, payload: unknown) {
   }
 }
 
+function makeId(prefix: string) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clearQueueTimer(player: PlayerSocket) {
+  if (player.queueTimer) {
+    clearTimeout(player.queueTimer);
+    player.queueTimer = null;
+  }
+}
+
 function removeFromQueue(ws: PlayerSocket) {
   const index = queue.indexOf(ws);
   if (index !== -1) {
     queue.splice(index, 1);
   }
   ws.inQueue = false;
+  clearQueueTimer(ws);
 }
 
-function makeId(prefix: string) {
-  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+function createBot(botNumber: number): MatchPlayer {
+  return {
+    seat: "",
+    name: `Bot ${botNumber}`,
+    playerId: makeId("bot"),
+    isBot: true,
+  };
+}
+
+function createMatch(players: PlayerSocket[]) {
+  const matchId = makeId("match");
+  const seats = ["N", "E", "S", "W"];
+
+  const humans: MatchPlayer[] = players.map((player) => ({
+    seat: "",
+    name: player.guestName ?? "Player",
+    playerId: player.playerId ?? makeId("player"),
+    isBot: false,
+  }));
+
+  const botsNeeded = 4 - humans.length;
+  const bots: MatchPlayer[] = Array.from({ length: botsNeeded }, (_, i) =>
+    createBot(i + 1),
+  );
+
+  const allPlayers = [...humans, ...bots].map((p, i) => ({
+    ...p,
+    seat: seats[i],
+  }));
+
+  players.forEach((player) => {
+    player.inQueue = false;
+    player.matchId = matchId;
+    clearQueueTimer(player);
+
+    send(player, {
+      t: "MATCH_FOUND",
+      d: {
+        matchId,
+        seat:
+          allPlayers.find((p) => p.playerId === player.playerId)?.seat ?? "N",
+        players: allPlayers,
+        hasBots: botsNeeded > 0,
+      },
+    });
+  });
+
+  console.log(
+    `Created ${matchId} with ${players.length} human(s) and ${botsNeeded} bot(s)`,
+  );
 }
 
 function tryMakeMatch() {
   while (queue.length >= 4) {
     const players = queue.splice(0, 4);
-    const matchId = makeId("match");
 
-    const seats = ["N", "E", "S", "W"];
-
-    players.forEach((player, index) => {
-      player.inQueue = false;
-      player.matchId = matchId;
-
-      send(player, {
-        t: "MATCH_FOUND",
-        d: {
-          matchId,
-          seat: seats[index],
-          players: players.map((p, i) => ({
-            seat: seats[i],
-            name: p.guestName ?? `Player ${i + 1}`,
-            playerId: p.playerId,
-          })),
-        },
-      });
+    players.forEach((p) => {
+      p.inQueue = false;
+      clearQueueTimer(p);
     });
 
-    console.log(
-      `Created ${matchId} with players: ${players
-        .map((p) => p.guestName ?? p.playerId)
-        .join(", ")}`,
-    );
+    createMatch(players);
   }
+}
+
+function startQueueTimeout(player: PlayerSocket) {
+  clearQueueTimer(player);
+
+  player.queueTimer = setTimeout(() => {
+    if (!player.inQueue) return;
+
+    const availableHumans = queue.splice(0, Math.min(queue.length, 4));
+
+    availableHumans.forEach((p) => {
+      p.inQueue = false;
+      clearQueueTimer(p);
+    });
+
+    if (availableHumans.length > 0) {
+      createMatch(availableHumans);
+    }
+  }, 10000);
 }
 
 wss.on("connection", (ws) => {
@@ -89,6 +156,7 @@ wss.on("connection", (ws) => {
   player.playerId = makeId("player");
   player.guestName = "Player";
   player.inQueue = false;
+  player.queueTimer = null;
 
   clients.add(player);
 
@@ -105,8 +173,6 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(msg.toString()) as ClientMessage;
 
-      console.log("Received:", data);
-
       if (data.t === "AUTH") {
         player.guestName = data.d?.guestName?.trim() || "Player";
 
@@ -117,7 +183,6 @@ wss.on("connection", (ws) => {
             guestName: player.guestName,
           },
         });
-
         return;
       }
 
@@ -140,9 +205,11 @@ wss.on("connection", (ws) => {
           d: {
             status: "joined",
             size: queue.length,
+            aiFallbackSeconds: 10,
           },
         });
 
+        startQueueTimeout(player);
         tryMakeMatch();
         return;
       }
@@ -154,7 +221,6 @@ wss.on("connection", (ws) => {
           t: "QUEUE_LEFT",
           d: {},
         });
-
         return;
       }
 
