@@ -1,23 +1,48 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 
-const server = http.createServer();
-const wss = new WebSocketServer({ server });
+const server = http.createServer((req, res) => {
+  if (req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Spades server is running");
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not found");
+});
+
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+});
 
 wss.on("connection", (ws) => {
   console.log("Player connected");
 
   ws.on("message", (msg) => {
-    console.log("Message:", msg.toString());
-    ws.send(JSON.stringify({ t: "ECHO", d: msg.toString() }));
+    const text = msg.toString();
+    console.log("Message:", text);
+
+    ws.send(
+      JSON.stringify({
+        t: "ECHO",
+        d: text,
+      }),
+    );
   });
 
   ws.on("close", () => {
     console.log("Player disconnected");
   });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+  });
 });
 
 const PORT = Number(process.env.PORT || 10000);
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Spades server running on :${PORT}`);
 });
