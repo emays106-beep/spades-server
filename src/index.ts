@@ -1,9 +1,30 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
+type Suit = "S" | "H" | "D" | "C";
+type Rank =
+  | "2"
+  | "3"
+  | "4"
+  | "5"
+  | "6"
+  | "7"
+  | "8"
+  | "9"
+  | "10"
+  | "J"
+  | "Q"
+  | "K"
+  | "A";
+
+type Card = {
+  suit: Suit;
+  rank: Rank;
+};
+
 type ClientMessage =
   | { t: "AUTH"; d?: { guestName?: string } }
-  | { t: "QUEUE_JOIN"; d?: { mode?: string } }
+  | { t: "QUEUE_JOIN"; d?: { mode?: string; teamCode?: string } }
   | { t: "QUEUE_LEAVE"; d?: Record<string, never> };
 
 type PlayerSocket = WebSocket & {
@@ -12,6 +33,7 @@ type PlayerSocket = WebSocket & {
   inQueue?: boolean;
   matchId?: string;
   queueTimer?: NodeJS.Timeout | null;
+  teamCode?: string;
 };
 
 type MatchPlayer = {
@@ -19,6 +41,8 @@ type MatchPlayer = {
   name: string;
   playerId: string;
   isBot: boolean;
+  teamCode?: string;
+  ws?: PlayerSocket;
 };
 
 const server = http.createServer((req, res) => {
@@ -66,55 +90,195 @@ function removeFromQueue(ws: PlayerSocket) {
   clearQueueTimer(ws);
 }
 
-function createBot(botNumber: number): MatchPlayer {
+function createBot(botNumber: number, teamCode = ""): MatchPlayer {
   return {
     seat: "",
     name: `Bot ${botNumber}`,
     playerId: makeId("bot"),
     isBot: true,
+    teamCode,
   };
 }
 
-function createMatch(players: PlayerSocket[]) {
-  const matchId = makeId("match");
-  const seats = ["N", "E", "S", "W"];
+function createDeck(): Card[] {
+  const suits: Suit[] = ["S", "H", "D", "C"];
+  const ranks: Rank[] = [
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "J",
+    "Q",
+    "K",
+    "A",
+  ];
 
-  const humans: MatchPlayer[] = players.map((player) => ({
+  const deck: Card[] = [];
+
+  for (const suit of suits) {
+    for (const rank of ranks) {
+      deck.push({ suit, rank });
+    }
+  }
+
+  return deck;
+}
+
+function shuffle<T>(items: T[]): T[] {
+  const arr = [...items];
+
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+
+  return arr;
+}
+
+function dealHands(players: MatchPlayer[]) {
+  const deck = shuffle(createDeck());
+  const hands: Record<string, Card[]> = {};
+
+  players.forEach((player) => {
+    hands[player.playerId] = [];
+  });
+
+  for (let i = 0; i < 52; i += 1) {
+    const player = players[i % 4];
+    hands[player.playerId].push(deck[i]);
+  }
+
+  return hands;
+}
+
+function buildHumans(players: PlayerSocket[]): MatchPlayer[] {
+  return players.map((player) => ({
     seat: "",
     name: player.guestName ?? "Player",
     playerId: player.playerId ?? makeId("player"),
     isBot: false,
+    teamCode: player.teamCode ?? "",
+    ws: player,
   }));
+}
 
-  const botsNeeded = 4 - humans.length;
-  const bots: MatchPlayer[] = Array.from({ length: botsNeeded }, (_, i) =>
-    createBot(i + 1),
-  );
+function findPairedHumans(humans: MatchPlayer[]) {
+  const byCode = new Map<string, MatchPlayer[]>();
 
-  const allPlayers = [...humans, ...bots].map((p, i) => ({
-    ...p,
+  for (const human of humans) {
+    const code = (human.teamCode ?? "").trim();
+    if (!code) continue;
+
+    if (!byCode.has(code)) {
+      byCode.set(code, []);
+    }
+    byCode.get(code)!.push(human);
+  }
+
+  for (const [, group] of byCode) {
+    if (group.length >= 2) {
+      return [group[0], group[1]];
+    }
+  }
+
+  return null;
+}
+
+function assignSeats(humans: MatchPlayer[]) {
+  const seats = ["N", "E", "S", "W"] as const;
+  const assigned: MatchPlayer[] = [];
+
+  const paired = findPairedHumans(humans);
+
+  if (paired) {
+    const [p1, p2] = paired;
+    assigned.push({ ...p1, seat: "N" });
+    assigned.push({ ...p2, seat: "S" });
+
+    const remainingHumans = humans.filter(
+      (h) => h.playerId !== p1.playerId && h.playerId !== p2.playerId,
+    );
+
+    const eastWest: MatchPlayer[] = [];
+
+    if (remainingHumans.length >= 2) {
+      eastWest.push({ ...remainingHumans[0], seat: "E" });
+      eastWest.push({ ...remainingHumans[1], seat: "W" });
+    } else if (remainingHumans.length === 1) {
+      eastWest.push({ ...remainingHumans[0], seat: "E" });
+      eastWest.push({ ...createBot(1), seat: "W" });
+    } else {
+      eastWest.push({ ...createBot(1), seat: "E" });
+      eastWest.push({ ...createBot(2), seat: "W" });
+    }
+
+    assigned.push(...eastWest);
+
+    return seats
+      .map((seat) => assigned.find((p) => p.seat === seat))
+      .filter(Boolean) as MatchPlayer[];
+  }
+
+  const filled = [...humans];
+
+  while (filled.length < 4) {
+    filled.push(createBot(filled.length - humans.length + 1));
+  }
+
+  return filled.slice(0, 4).map((player, i) => ({
+    ...player,
     seat: seats[i],
   }));
+}
+
+function createMatch(players: PlayerSocket[]) {
+  const matchId = makeId("match");
+  const humans = buildHumans(players);
+  const allPlayers = assignSeats(humans);
+  const hands = dealHands(allPlayers);
 
   players.forEach((player) => {
     player.inQueue = false;
     player.matchId = matchId;
     clearQueueTimer(player);
 
+    const thisPlayer = allPlayers.find((p) => p.playerId === player.playerId);
+
     send(player, {
       t: "MATCH_FOUND",
       d: {
         matchId,
-        seat:
-          allPlayers.find((p) => p.playerId === player.playerId)?.seat ?? "N",
-        players: allPlayers,
-        hasBots: botsNeeded > 0,
+        seat: thisPlayer?.seat ?? "N",
+        players: allPlayers.map((p) => ({
+          seat: p.seat,
+          name: p.name,
+          playerId: p.playerId,
+          isBot: p.isBot,
+          teamCode: p.teamCode ?? "",
+        })),
+        hasBots: allPlayers.some((p) => p.isBot),
+      },
+    });
+
+    send(player, {
+      t: "HAND_DEALT",
+      d: {
+        matchId,
+        seat: thisPlayer?.seat ?? "N",
+        hand: hands[player.playerId ?? ""],
       },
     });
   });
 
   console.log(
-    `Created ${matchId} with ${players.length} human(s) and ${botsNeeded} bot(s)`,
+    `Created ${matchId} with players: ${allPlayers
+      .map((p) => `${p.seat}:${p.name}${p.teamCode ? `[${p.teamCode}]` : ""}`)
+      .join(", ")}`,
   );
 }
 
@@ -157,6 +321,7 @@ wss.on("connection", (ws) => {
   player.guestName = "Player";
   player.inQueue = false;
   player.queueTimer = null;
+  player.teamCode = "";
 
   clients.add(player);
 
@@ -197,6 +362,7 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        player.teamCode = data.d?.teamCode?.trim() || "";
         player.inQueue = true;
         queue.push(player);
 
@@ -205,6 +371,7 @@ wss.on("connection", (ws) => {
           d: {
             status: "joined",
             size: queue.length,
+            teamCode: player.teamCode,
             aiFallbackSeconds: 10,
           },
         });
