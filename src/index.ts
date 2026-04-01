@@ -20,17 +20,30 @@ const wss = new WebSocketServer({
 wss.on("connection", (ws) => {
   console.log("Player connected");
 
-  ws.on("message", (msg) => {
-    const text = msg.toString();
-    console.log("Message:", text);
+ws.on("message", (msg) => {
+  try {
+    const data = JSON.parse(msg.toString());
 
-    ws.send(
-      JSON.stringify({
-        t: "ECHO",
-        d: text,
-      }),
-    );
-  });
+    console.log("Received:", data);
+
+    if (data.t === "AUTH") {
+      ws.send(JSON.stringify({
+        t: "AUTH_OK",
+        d: { message: "Welcome!" }
+      }));
+    }
+
+    if (data.t === "QUEUE_JOIN") {
+      ws.send(JSON.stringify({
+        t: "QUEUE_OK",
+        d: { message: "Joined queue" }
+      }));
+    }
+
+  } catch (err) {
+    console.error("Invalid message:", err);
+  }
+});
 
   ws.on("close", () => {
     console.log("Player disconnected");
