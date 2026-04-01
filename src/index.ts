@@ -25,7 +25,8 @@ type Card = {
 type ClientMessage =
   | { t: "AUTH"; d?: { guestName?: string } }
   | { t: "QUEUE_JOIN"; d?: { mode?: string; teamCode?: string } }
-  | { t: "QUEUE_LEAVE"; d?: Record<string, never> };
+  | { t: "QUEUE_LEAVE"; d?: Record<string, never> }
+  | { t: "PLAY_CARD"; d?: { matchId?: string; seat?: string; card?: Card } };
 
 type PlayerSocket = WebSocket & {
   playerId?: string;
@@ -43,6 +44,13 @@ type MatchPlayer = {
   isBot: boolean;
   teamCode?: string;
   ws?: PlayerSocket;
+};
+
+type MatchState = {
+  matchId: string;
+  players: MatchPlayer[];
+  hands: Record<string, Card[]>;
+  tableCards: Array<{ seat: string; card: Card }>;
 };
 
 const server = http.createServer((req, res) => {
@@ -63,10 +71,19 @@ const wss = new WebSocketServer({
 
 const queue: PlayerSocket[] = [];
 const clients = new Set<PlayerSocket>();
+const matches = new Map<string, MatchState>();
 
 function send(ws: PlayerSocket, payload: unknown) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
+  }
+}
+
+function broadcastToMatch(match: MatchState, payload: unknown) {
+  for (const player of match.players) {
+    if (!player.isBot && player.ws) {
+      send(player.ws, payload);
+    }
   }
 }
 
@@ -236,11 +253,24 @@ function assignSeats(humans: MatchPlayer[]) {
   }));
 }
 
+function cardsEqual(a?: Card, b?: Card) {
+  return !!a && !!b && a.suit === b.suit && a.rank === b.rank;
+}
+
 function createMatch(players: PlayerSocket[]) {
   const matchId = makeId("match");
   const humans = buildHumans(players);
   const allPlayers = assignSeats(humans);
   const hands = dealHands(allPlayers);
+
+  const match: MatchState = {
+    matchId,
+    players: allPlayers,
+    hands,
+    tableCards: [],
+  };
+
+  matches.set(matchId, match);
 
   players.forEach((player) => {
     player.inQueue = false;
@@ -388,6 +418,73 @@ wss.on("connection", (ws) => {
           t: "QUEUE_LEFT",
           d: {},
         });
+        return;
+      }
+
+      if (data.t === "PLAY_CARD") {
+        const matchId = data.d?.matchId;
+        const seat = data.d?.seat;
+        const card = data.d?.card;
+
+        if (!matchId || !seat || !card) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Missing PLAY_CARD data" },
+          });
+          return;
+        }
+
+        const match = matches.get(matchId);
+
+        if (!match) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Match not found" },
+          });
+          return;
+        }
+
+        const matchPlayer = match.players.find(
+          (p) => p.playerId === player.playerId && p.seat === seat,
+        );
+
+        if (!matchPlayer) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Player not in match seat" },
+          });
+          return;
+        }
+
+        const hand = match.hands[player.playerId ?? ""] ?? [];
+        const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
+
+        if (cardIndex === -1) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Card not in hand" },
+          });
+          return;
+        }
+
+        const [playedCard] = hand.splice(cardIndex, 1);
+
+        match.tableCards.push({
+          seat,
+          card: playedCard,
+        });
+
+        broadcastToMatch(match, {
+          t: "CARD_PLAYED",
+          d: {
+            matchId,
+            seat,
+            card: playedCard,
+            remainingCount: hand.length,
+            tableCards: match.tableCards,
+          },
+        });
+
         return;
       }
 
