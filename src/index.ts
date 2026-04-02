@@ -62,6 +62,7 @@ type MatchState = {
     NS: number;
     EW: number;
   };
+  botTurnTimer?: NodeJS.Timeout | null;
 };
 
 const TURN_ORDER = ["N", "E", "S", "W"] as const;
@@ -108,6 +109,13 @@ function clearQueueTimer(player: PlayerSocket) {
   if (player.queueTimer) {
     clearTimeout(player.queueTimer);
     player.queueTimer = null;
+  }
+}
+
+function clearBotTurnTimer(match: MatchState) {
+  if (match.botTurnTimer) {
+    clearTimeout(match.botTurnTimer);
+    match.botTurnTimer = null;
   }
 }
 
@@ -300,6 +308,15 @@ function rankValue(rank: Rank) {
   return values[rank];
 }
 
+function sortCardsLow(cards: Card[]) {
+  return [...cards].sort((a, b) => {
+    if (a.suit !== b.suit) {
+      return a.suit.localeCompare(b.suit);
+    }
+    return rankValue(a.rank) - rankValue(b.rank);
+  });
+}
+
 function determineTrickWinner(tableCards: TableCard[]) {
   if (tableCards.length !== 4) {
     return null;
@@ -328,6 +345,202 @@ function onlySpadesLeft(cards: Card[]) {
   return cards.length > 0 && cards.every((card) => card.suit === "S");
 }
 
+function findPlayerBySeat(match: MatchState, seat: string) {
+  return match.players.find((p) => p.seat === seat);
+}
+
+function chooseBotLeadCard(hand: Card[], spadesBroken: boolean) {
+  const sorted = sortCardsLow(hand);
+  const nonSpades = sorted.filter((card) => card.suit !== "S");
+  const spades = sorted.filter((card) => card.suit === "S");
+
+  if (!spadesBroken && nonSpades.length > 0) {
+    return nonSpades[0];
+  }
+
+  if (nonSpades.length > 0) {
+    return nonSpades[0];
+  }
+
+  return spades[0];
+}
+
+function chooseBotFollowCard(hand: Card[], leadSuit: Suit) {
+  const sorted = sortCardsLow(hand);
+  const sameSuit = sorted.filter((card) => card.suit === leadSuit);
+
+  if (sameSuit.length > 0) {
+    return sameSuit[0];
+  }
+
+  const nonSpades = sorted.filter((card) => card.suit !== "S");
+  if (nonSpades.length > 0) {
+    return nonSpades[0];
+  }
+
+  const spades = sorted.filter((card) => card.suit === "S");
+  return spades[0];
+}
+
+function chooseBotCard(match: MatchState, hand: Card[]) {
+  if (match.tableCards.length === 0) {
+    return chooseBotLeadCard(hand, match.spadesBroken);
+  }
+
+  const leadSuit = match.tableCards[0].card.suit;
+  return chooseBotFollowCard(hand, leadSuit);
+}
+
+function scheduleBotTurnIfNeeded(match: MatchState) {
+  clearBotTurnTimer(match);
+
+  const currentPlayer = findPlayerBySeat(match, match.currentTurn);
+  if (!currentPlayer || !currentPlayer.isBot) {
+    return;
+  }
+
+  match.botTurnTimer = setTimeout(() => {
+    playBotTurn(match.matchId);
+  }, 900);
+}
+
+function finishTrickIfReady(match: MatchState) {
+  if (match.tableCards.length !== 4) {
+    return;
+  }
+
+  const finishedTrick = [...match.tableCards];
+  const winner = determineTrickWinner(finishedTrick);
+
+  if (!winner) {
+    return;
+  }
+
+  const winnerTeam = seatToTeam(winner.seat);
+  match.teamTricks[winnerTeam] += 1;
+  match.currentTurn = winner.seat;
+
+  broadcastToMatch(match, {
+    t: "TRICK_COMPLETE",
+    d: {
+      matchId: match.matchId,
+      winnerSeat: winner.seat,
+      winnerCard: winner.card,
+      tableCards: finishedTrick,
+      teamTricks: match.teamTricks,
+      spadesBroken: match.spadesBroken,
+    },
+  });
+
+  match.tableCards = [];
+
+  broadcastToMatch(match, {
+    t: "TURN_UPDATE",
+    d: {
+      matchId: match.matchId,
+      currentTurn: match.currentTurn,
+      spadesBroken: match.spadesBroken,
+    },
+  });
+
+  broadcastToMatch(match, {
+    t: "TABLE_CLEAR",
+    d: {
+      matchId: match.matchId,
+    },
+  });
+
+  scheduleBotTurnIfNeeded(match);
+}
+
+function playValidatedCard(
+  match: MatchState,
+  playerId: string,
+  seat: string,
+  card: Card,
+) {
+  const hand = match.hands[playerId] ?? [];
+  const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
+
+  if (cardIndex === -1) {
+    return { ok: false, error: "Card not in hand" as const };
+  }
+
+  if (match.tableCards.length > 0) {
+    const leadSuit = match.tableCards[0].card.suit;
+    const playerHasLeadSuit = hasSuit(hand, leadSuit);
+
+    if (playerHasLeadSuit && card.suit !== leadSuit) {
+      return { ok: false, error: `You must follow suit: ${leadSuit}` as const };
+    }
+
+    if (card.suit === "S" && leadSuit !== "S") {
+      match.spadesBroken = true;
+    }
+  } else {
+    const leadingWithSpade = card.suit === "S";
+    const canLeadSpade = match.spadesBroken || onlySpadesLeft(hand);
+
+    if (leadingWithSpade && !canLeadSpade) {
+      return { ok: false, error: "Spades have not been broken yet" as const };
+    }
+  }
+
+  const [playedCard] = hand.splice(cardIndex, 1);
+
+  match.tableCards.push({
+    seat,
+    card: playedCard,
+  });
+
+  if (playedCard.suit === "S" && match.tableCards.length > 1) {
+    match.spadesBroken = true;
+  }
+
+  if (match.tableCards.length < 4) {
+    match.currentTurn = nextSeat(seat);
+  }
+
+  broadcastToMatch(match, {
+    t: "CARD_PLAYED",
+    d: {
+      matchId: match.matchId,
+      seat,
+      card: playedCard,
+      remainingCount: hand.length,
+      tableCards: match.tableCards,
+      currentTurn: match.currentTurn,
+      spadesBroken: match.spadesBroken,
+    },
+  });
+
+  finishTrickIfReady(match);
+
+  if (match.tableCards.length > 0) {
+    scheduleBotTurnIfNeeded(match);
+  }
+
+  return { ok: true, card: playedCard } as const;
+}
+
+function playBotTurn(matchId: string) {
+  const match = matches.get(matchId);
+  if (!match) return;
+
+  clearBotTurnTimer(match);
+
+  const bot = findPlayerBySeat(match, match.currentTurn);
+  if (!bot || !bot.isBot) return;
+
+  const hand = match.hands[bot.playerId] ?? [];
+  if (hand.length === 0) return;
+
+  const chosen = chooseBotCard(match, hand);
+  if (!chosen) return;
+
+  playValidatedCard(match, bot.playerId, bot.seat, chosen);
+}
+
 function createMatch(players: PlayerSocket[]) {
   const matchId = makeId("match");
   const humans = buildHumans(players);
@@ -345,6 +558,7 @@ function createMatch(players: PlayerSocket[]) {
       NS: 0,
       EW: 0,
     },
+    botTurnTimer: null,
   };
 
   matches.set(matchId, match);
@@ -400,6 +614,8 @@ function createMatch(players: PlayerSocket[]) {
       .map((p) => `${p.seat}:${p.name}${p.teamCode ? `[${p.teamCode}]` : ""}`)
       .join(", ")}`,
   );
+
+  scheduleBotTurnIfNeeded(match);
 }
 
 function tryMakeMatch() {
@@ -554,112 +770,13 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        const hand = match.hands[player.playerId ?? ""] ?? [];
-        const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
+        const result = playValidatedCard(match, player.playerId ?? "", seat, card);
 
-        if (cardIndex === -1) {
+        if (!result.ok) {
           send(player, {
             t: "ERROR",
-            d: { message: "Card not in hand" },
+            d: { message: result.error },
           });
-          return;
-        }
-
-        if (match.tableCards.length > 0) {
-          const leadSuit = match.tableCards[0].card.suit;
-          const playerHasLeadSuit = hasSuit(hand, leadSuit);
-
-          if (playerHasLeadSuit && card.suit !== leadSuit) {
-            send(player, {
-              t: "ERROR",
-              d: { message: `You must follow suit: ${leadSuit}` },
-            });
-            return;
-          }
-
-          if (card.suit === "S" && leadSuit !== "S") {
-            match.spadesBroken = true;
-          }
-        } else {
-          const leadingWithSpade = card.suit === "S";
-          const canLeadSpade = match.spadesBroken || onlySpadesLeft(hand);
-
-          if (leadingWithSpade && !canLeadSpade) {
-            send(player, {
-              t: "ERROR",
-              d: { message: "Spades have not been broken yet" },
-            });
-            return;
-          }
-        }
-
-        const [playedCard] = hand.splice(cardIndex, 1);
-
-        match.tableCards.push({
-          seat,
-          card: playedCard,
-        });
-
-        if (playedCard.suit === "S" && match.tableCards.length > 1) {
-          match.spadesBroken = true;
-        }
-
-        if (match.tableCards.length < 4) {
-          match.currentTurn = nextSeat(seat);
-        }
-
-        broadcastToMatch(match, {
-          t: "CARD_PLAYED",
-          d: {
-            matchId,
-            seat,
-            card: playedCard,
-            remainingCount: hand.length,
-            tableCards: match.tableCards,
-            currentTurn: match.currentTurn,
-            spadesBroken: match.spadesBroken,
-          },
-        });
-
-        if (match.tableCards.length === 4) {
-          const finishedTrick = [...match.tableCards];
-          const winner = determineTrickWinner(finishedTrick);
-
-          if (winner) {
-            const winnerTeam = seatToTeam(winner.seat);
-            match.teamTricks[winnerTeam] += 1;
-            match.currentTurn = winner.seat;
-
-            broadcastToMatch(match, {
-              t: "TRICK_COMPLETE",
-              d: {
-                matchId,
-                winnerSeat: winner.seat,
-                winnerCard: winner.card,
-                tableCards: finishedTrick,
-                teamTricks: match.teamTricks,
-                spadesBroken: match.spadesBroken,
-              },
-            });
-
-            match.tableCards = [];
-
-            broadcastToMatch(match, {
-              t: "TURN_UPDATE",
-              d: {
-                matchId,
-                currentTurn: match.currentTurn,
-                spadesBroken: match.spadesBroken,
-              },
-            });
-
-            broadcastToMatch(match, {
-              t: "TABLE_CLEAR",
-              d: {
-                matchId,
-              },
-            });
-          }
         }
 
         return;
