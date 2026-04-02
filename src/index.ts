@@ -57,6 +57,10 @@ type MatchState = {
   hands: Record<string, Card[]>;
   tableCards: TableCard[];
   currentTurn: string;
+  teamTricks: {
+    NS: number;
+    EW: number;
+  };
 };
 
 const TURN_ORDER = ["N", "E", "S", "W"] as const;
@@ -271,6 +275,49 @@ function nextSeat(seat: string) {
   return TURN_ORDER[(index + 1) % TURN_ORDER.length];
 }
 
+function seatToTeam(seat: string) {
+  return seat === "N" || seat === "S" ? "NS" : "EW";
+}
+
+function rankValue(rank: Rank) {
+  const values: Record<Rank, number> = {
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "10": 10,
+    J: 11,
+    Q: 12,
+    K: 13,
+    A: 14,
+  };
+
+  return values[rank];
+}
+
+function determineTrickWinner(tableCards: TableCard[]) {
+  if (tableCards.length !== 4) {
+    return null;
+  }
+
+  const leadSuit = tableCards[0].card.suit;
+  const spadesPlayed = tableCards.filter((entry) => entry.card.suit === "S");
+
+  let contenders = spadesPlayed.length > 0
+    ? spadesPlayed
+    : tableCards.filter((entry) => entry.card.suit === leadSuit);
+
+  contenders = contenders.sort(
+    (a, b) => rankValue(b.card.rank) - rankValue(a.card.rank),
+  );
+
+  return contenders[0];
+}
+
 function createMatch(players: PlayerSocket[]) {
   const matchId = makeId("match");
   const humans = buildHumans(players);
@@ -283,6 +330,10 @@ function createMatch(players: PlayerSocket[]) {
     hands,
     tableCards: [],
     currentTurn: "N",
+    teamTricks: {
+      NS: 0,
+      EW: 0,
+    },
   };
 
   matches.set(matchId, match);
@@ -492,7 +543,7 @@ wss.on("connection", (ws) => {
         const hand = match.hands[player.playerId ?? ""] ?? [];
         const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
 
-        if (cardIndex == -1) {
+        if (cardIndex === -1) {
           send(player, {
             t: "ERROR",
             d: { message: "Card not in hand" },
@@ -525,32 +576,41 @@ wss.on("connection", (ws) => {
 
         if (match.tableCards.length === 4) {
           const finishedTrick = [...match.tableCards];
+          const winner = determineTrickWinner(finishedTrick);
 
-          broadcastToMatch(match, {
-            t: "TRICK_COMPLETE",
-            d: {
-              matchId,
-              tableCards: finishedTrick,
-            },
-          });
+          if (winner) {
+            const winnerTeam = seatToTeam(winner.seat);
+            match.teamTricks[winnerTeam] += 1;
+            match.currentTurn = winner.seat;
 
-          match.tableCards = [];
-          match.currentTurn = "N";
+            broadcastToMatch(match, {
+              t: "TRICK_COMPLETE",
+              d: {
+                matchId,
+                winnerSeat: winner.seat,
+                winnerCard: winner.card,
+                tableCards: finishedTrick,
+                teamTricks: match.teamTricks,
+              },
+            });
 
-          broadcastToMatch(match, {
-            t: "TURN_UPDATE",
-            d: {
-              matchId,
-              currentTurn: match.currentTurn,
-            },
-          });
+            match.tableCards = [];
 
-          broadcastToMatch(match, {
-            t: "TABLE_CLEAR",
-            d: {
-              matchId,
-            },
-          });
+            broadcastToMatch(match, {
+              t: "TURN_UPDATE",
+              d: {
+                matchId,
+                currentTurn: match.currentTurn,
+              },
+            });
+
+            broadcastToMatch(match, {
+              t: "TABLE_CLEAR",
+              d: {
+                matchId,
+              },
+            });
+          }
         }
 
         return;
