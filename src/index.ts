@@ -57,6 +57,7 @@ type MatchState = {
   hands: Record<string, Card[]>;
   tableCards: TableCard[];
   currentTurn: string;
+  spadesBroken: boolean;
   teamTricks: {
     NS: number;
     EW: number;
@@ -323,6 +324,10 @@ function hasSuit(cards: Card[], suit: Suit) {
   return cards.some((card) => card.suit === suit);
 }
 
+function onlySpadesLeft(cards: Card[]) {
+  return cards.length > 0 && cards.every((card) => card.suit === "S");
+}
+
 function createMatch(players: PlayerSocket[]) {
   const matchId = makeId("match");
   const humans = buildHumans(players);
@@ -335,6 +340,7 @@ function createMatch(players: PlayerSocket[]) {
     hands,
     tableCards: [],
     currentTurn: "N",
+    spadesBroken: false,
     teamTricks: {
       NS: 0,
       EW: 0,
@@ -364,6 +370,7 @@ function createMatch(players: PlayerSocket[]) {
         })),
         hasBots: allPlayers.some((p) => p.isBot),
         currentTurn: match.currentTurn,
+        spadesBroken: match.spadesBroken,
       },
     });
 
@@ -374,6 +381,7 @@ function createMatch(players: PlayerSocket[]) {
         seat: thisPlayer?.seat ?? "N",
         hand: hands[player.playerId ?? ""],
         currentTurn: match.currentTurn,
+        spadesBroken: match.spadesBroken,
       },
     });
   });
@@ -383,6 +391,7 @@ function createMatch(players: PlayerSocket[]) {
     d: {
       matchId,
       currentTurn: match.currentTurn,
+      spadesBroken: match.spadesBroken,
     },
   });
 
@@ -567,6 +576,21 @@ wss.on("connection", (ws) => {
             });
             return;
           }
+
+          if (card.suit === "S" && leadSuit !== "S") {
+            match.spadesBroken = true;
+          }
+        } else {
+          const leadingWithSpade = card.suit === "S";
+          const canLeadSpade = match.spadesBroken || onlySpadesLeft(hand);
+
+          if (leadingWithSpade && !canLeadSpade) {
+            send(player, {
+              t: "ERROR",
+              d: { message: "Spades have not been broken yet" },
+            });
+            return;
+          }
         }
 
         const [playedCard] = hand.splice(cardIndex, 1);
@@ -575,6 +599,10 @@ wss.on("connection", (ws) => {
           seat,
           card: playedCard,
         });
+
+        if (playedCard.suit === "S" && match.tableCards.length > 1) {
+          match.spadesBroken = true;
+        }
 
         if (match.tableCards.length < 4) {
           match.currentTurn = nextSeat(seat);
@@ -589,6 +617,7 @@ wss.on("connection", (ws) => {
             remainingCount: hand.length,
             tableCards: match.tableCards,
             currentTurn: match.currentTurn,
+            spadesBroken: match.spadesBroken,
           },
         });
 
@@ -609,6 +638,7 @@ wss.on("connection", (ws) => {
                 winnerCard: winner.card,
                 tableCards: finishedTrick,
                 teamTricks: match.teamTricks,
+                spadesBroken: match.spadesBroken,
               },
             });
 
@@ -619,6 +649,7 @@ wss.on("connection", (ws) => {
               d: {
                 matchId,
                 currentTurn: match.currentTurn,
+                spadesBroken: match.spadesBroken,
               },
             });
 
