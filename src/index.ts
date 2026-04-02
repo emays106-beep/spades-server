@@ -26,6 +26,7 @@ type ClientMessage =
   | { t: "AUTH"; d?: { guestName?: string } }
   | { t: "QUEUE_JOIN"; d?: { mode?: string; teamCode?: string } }
   | { t: "QUEUE_LEAVE"; d?: Record<string, never> }
+  | { t: "BID_SUBMIT"; d?: { matchId?: string; seat?: string; bid?: number } }
   | { t: "PLAY_CARD"; d?: { matchId?: string; seat?: string; card?: Card } };
 
 type PlayerSocket = WebSocket & {
@@ -62,10 +63,14 @@ type MatchState = {
     NS: number;
     EW: number;
   };
+  bids: Record<string, number | null>;
+  biddingComplete: boolean;
   botTurnTimer?: NodeJS.Timeout | null;
+  botBidTimer?: NodeJS.Timeout | null;
 };
 
 const TURN_ORDER = ["N", "E", "S", "W"] as const;
+const SEATS = ["N", "E", "S", "W"] as const;
 
 const server = http.createServer((req, res) => {
   if (req.url === "/") {
@@ -116,6 +121,13 @@ function clearBotTurnTimer(match: MatchState) {
   if (match.botTurnTimer) {
     clearTimeout(match.botTurnTimer);
     match.botTurnTimer = null;
+  }
+}
+
+function clearBotBidTimer(match: MatchState) {
+  if (match.botBidTimer) {
+    clearTimeout(match.botBidTimer);
+    match.botBidTimer = null;
   }
 }
 
@@ -228,7 +240,6 @@ function findPairedHumans(humans: MatchPlayer[]) {
 }
 
 function assignSeats(humans: MatchPlayer[]) {
-  const seats = ["N", "E", "S", "W"] as const;
   const assigned: MatchPlayer[] = [];
 
   const paired = findPairedHumans(humans);
@@ -257,9 +268,7 @@ function assignSeats(humans: MatchPlayer[]) {
 
     assigned.push(...eastWest);
 
-    return seats
-      .map((seat) => assigned.find((p) => p.seat === seat))
-      .filter(Boolean) as MatchPlayer[];
+    return SEATS.map((seat) => assigned.find((p) => p.seat === seat)!);
   }
 
   const filled = [...humans];
@@ -270,7 +279,7 @@ function assignSeats(humans: MatchPlayer[]) {
 
   return filled.slice(0, 4).map((player, i) => ({
     ...player,
-    seat: seats[i],
+    seat: SEATS[i],
   }));
 }
 
@@ -318,9 +327,7 @@ function sortCardsLow(cards: Card[]) {
 }
 
 function determineTrickWinner(tableCards: TableCard[]) {
-  if (tableCards.length !== 4) {
-    return null;
-  }
+  if (tableCards.length !== 4) return null;
 
   const leadSuit = tableCards[0].card.suit;
   const spadesPlayed = tableCards.filter((entry) => entry.card.suit === "S");
@@ -354,14 +361,8 @@ function chooseBotLeadCard(hand: Card[], spadesBroken: boolean) {
   const nonSpades = sorted.filter((card) => card.suit !== "S");
   const spades = sorted.filter((card) => card.suit === "S");
 
-  if (!spadesBroken && nonSpades.length > 0) {
-    return nonSpades[0];
-  }
-
-  if (nonSpades.length > 0) {
-    return nonSpades[0];
-  }
-
+  if (!spadesBroken && nonSpades.length > 0) return nonSpades[0];
+  if (nonSpades.length > 0) return nonSpades[0];
   return spades[0];
 }
 
@@ -369,14 +370,10 @@ function chooseBotFollowCard(hand: Card[], leadSuit: Suit) {
   const sorted = sortCardsLow(hand);
   const sameSuit = sorted.filter((card) => card.suit === leadSuit);
 
-  if (sameSuit.length > 0) {
-    return sameSuit[0];
-  }
+  if (sameSuit.length > 0) return sameSuit[0];
 
   const nonSpades = sorted.filter((card) => card.suit !== "S");
-  if (nonSpades.length > 0) {
-    return nonSpades[0];
-  }
+  if (nonSpades.length > 0) return nonSpades[0];
 
   const spades = sorted.filter((card) => card.suit === "S");
   return spades[0];
@@ -391,13 +388,105 @@ function chooseBotCard(match: MatchState, hand: Card[]) {
   return chooseBotFollowCard(hand, leadSuit);
 }
 
+function estimateBotBid(hand: Card[]) {
+  let bid = 0;
+
+  for (const card of hand) {
+    if (card.suit === "S") {
+      if (card.rank === "A" || card.rank === "K" || card.rank === "Q") bid += 1;
+      else if (card.rank === "J" || card.rank === "10") bid += 0.5;
+      else bid += 0.25;
+    } else {
+      if (card.rank === "A") bid += 1;
+      else if (card.rank === "K") bid += 0.75;
+      else if (card.rank === "Q") bid += 0.5;
+    }
+  }
+
+  const rounded = Math.max(1, Math.min(13, Math.round(bid)));
+  return rounded;
+}
+
+function teamBidTotal(match: MatchState, team: "NS" | "EW") {
+  const seats = team === "NS" ? ["N", "S"] : ["E", "W"];
+  return seats.reduce((sum, seat) => sum + (match.bids[seat] ?? 0), 0);
+}
+
+function maybeCompleteBidding(match: MatchState) {
+  const allBid = SEATS.every((seat) => match.bids[seat] !== null);
+  if (!allBid || match.biddingComplete) return;
+
+  match.biddingComplete = true;
+  match.currentTurn = "N";
+
+  broadcastToMatch(match, {
+    t: "BIDDING_COMPLETE",
+    d: {
+      matchId: match.matchId,
+      bids: match.bids,
+      teamBids: {
+        NS: teamBidTotal(match, "NS"),
+        EW: teamBidTotal(match, "EW"),
+      },
+    },
+  });
+
+  broadcastToMatch(match, {
+    t: "TURN_UPDATE",
+    d: {
+      matchId: match.matchId,
+      currentTurn: match.currentTurn,
+      spadesBroken: match.spadesBroken,
+    },
+  });
+
+  scheduleBotTurnIfNeeded(match);
+}
+
+function scheduleBotBidIfNeeded(match: MatchState) {
+  clearBotBidTimer(match);
+
+  const nextBot = SEATS.find((seat) => {
+    const player = findPlayerBySeat(match, seat);
+    return player?.isBot && match.bids[seat] === null;
+  });
+
+  if (!nextBot) {
+    maybeCompleteBidding(match);
+    return;
+  }
+
+  match.botBidTimer = setTimeout(() => {
+    const player = findPlayerBySeat(match, nextBot);
+    if (!player || !player.isBot) return;
+
+    const hand = match.hands[player.playerId] ?? [];
+    const bid = estimateBotBid(hand);
+
+    match.bids[nextBot] = bid;
+
+    broadcastToMatch(match, {
+      t: "BID_ACCEPTED",
+      d: {
+        matchId: match.matchId,
+        seat: nextBot,
+        bid,
+        bids: match.bids,
+      },
+    });
+
+    scheduleBotBidIfNeeded(match);
+    maybeCompleteBidding(match);
+  }, 700);
+}
+
 function scheduleBotTurnIfNeeded(match: MatchState) {
   clearBotTurnTimer(match);
 
+  if (!match.biddingComplete) return;
+
   const currentPlayer = findPlayerBySeat(match, match.currentTurn);
-  if (!currentPlayer || !currentPlayer.isBot) {
-    return;
-  }
+  if (!currentPlayer || !currentPlayer.isBot) return;
 
   match.botTurnTimer = setTimeout(() => {
     playBotTurn(match.matchId);
@@ -405,16 +494,12 @@ function scheduleBotTurnIfNeeded(match: MatchState) {
 }
 
 function finishTrickIfReady(match: MatchState) {
-  if (match.tableCards.length !== 4) {
-    return;
-  }
+  if (match.tableCards.length !== 4) return;
 
   const finishedTrick = [...match.tableCards];
   const winner = determineTrickWinner(finishedTrick);
 
-  if (!winner) {
-    return;
-  }
+  if (!winner) return;
 
   const winnerTeam = seatToTeam(winner.seat);
   match.teamTricks[winnerTeam] += 1;
@@ -459,6 +544,10 @@ function playValidatedCard(
   seat: string,
   card: Card,
 ) {
+  if (!match.biddingComplete) {
+    return { ok: false, error: "Bidding is not complete" as const };
+  }
+
   const hand = match.hands[playerId] ?? [];
   const cardIndex = hand.findIndex((c) => cardsEqual(c, card));
 
@@ -529,6 +618,8 @@ function playBotTurn(matchId: string) {
 
   clearBotTurnTimer(match);
 
+  if (!match.biddingComplete) return;
+
   const bot = findPlayerBySeat(match, match.currentTurn);
   if (!bot || !bot.isBot) return;
 
@@ -547,6 +638,13 @@ function createMatch(players: PlayerSocket[]) {
   const allPlayers = assignSeats(humans);
   const hands = dealHands(allPlayers);
 
+  const bids: Record<string, number | null> = {
+    N: null,
+    E: null,
+    S: null,
+    W: null,
+  };
+
   const match: MatchState = {
     matchId,
     players: allPlayers,
@@ -558,7 +656,10 @@ function createMatch(players: PlayerSocket[]) {
       NS: 0,
       EW: 0,
     },
+    bids,
+    biddingComplete: false,
     botTurnTimer: null,
+    botBidTimer: null,
   };
 
   matches.set(matchId, match);
@@ -598,24 +699,31 @@ function createMatch(players: PlayerSocket[]) {
         spadesBroken: match.spadesBroken,
       },
     });
+
+    send(player, {
+      t: "BID_REQUEST",
+      d: {
+        matchId,
+        seat: thisPlayer?.seat ?? "N",
+      },
+    });
   });
 
   broadcastToMatch(match, {
-    t: "TURN_UPDATE",
+    t: "BID_STATUS",
     d: {
       matchId,
-      currentTurn: match.currentTurn,
-      spadesBroken: match.spadesBroken,
+      bids: match.bids,
     },
   });
+
+  scheduleBotBidIfNeeded(match);
 
   console.log(
     `Created ${matchId} with players: ${allPlayers
       .map((p) => `${p.seat}:${p.name}${p.teamCode ? `[${p.teamCode}]` : ""}`)
       .join(", ")}`,
   );
-
-  scheduleBotTurnIfNeeded(match);
 }
 
 function tryMakeMatch() {
@@ -724,6 +832,73 @@ wss.on("connection", (ws) => {
           t: "QUEUE_LEFT",
           d: {},
         });
+        return;
+      }
+
+      if (data.t === "BID_SUBMIT") {
+        const matchId = data.d?.matchId;
+        const seat = data.d?.seat;
+        const bid = data.d?.bid;
+
+        if (!matchId || !seat || typeof bid !== "number") {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Missing bid data" },
+          });
+          return;
+        }
+
+        const match = matches.get(matchId);
+        if (!match) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Match not found" },
+          });
+          return;
+        }
+
+        if (match.biddingComplete) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Bidding already complete" },
+          });
+          return;
+        }
+
+        if (bid < 1 || bid > 13) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Bid must be between 1 and 13" },
+          });
+          return;
+        }
+
+        const matchPlayer = match.players.find(
+          (p) => p.playerId === player.playerId && p.seat === seat,
+        );
+
+        if (!matchPlayer) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Player not in match seat" },
+          });
+          return;
+        }
+
+        match.bids[seat] = bid;
+
+        broadcastToMatch(match, {
+          t: "BID_ACCEPTED",
+          d: {
+            matchId,
+            seat,
+            bid,
+            bids: match.bids,
+          },
+        });
+
+        scheduleBotBidIfNeeded(match);
+        maybeCompleteBidding(match);
         return;
       }
 
