@@ -307,15 +307,20 @@ function determineTrickWinner(tableCards: TableCard[]) {
   const leadSuit = tableCards[0].card.suit;
   const spadesPlayed = tableCards.filter((entry) => entry.card.suit === "S");
 
-  let contenders = spadesPlayed.length > 0
-    ? spadesPlayed
-    : tableCards.filter((entry) => entry.card.suit === leadSuit);
+  let contenders =
+    spadesPlayed.length > 0
+      ? spadesPlayed
+      : tableCards.filter((entry) => entry.card.suit === leadSuit);
 
   contenders = contenders.sort(
     (a, b) => rankValue(b.card.rank) - rankValue(a.card.rank),
   );
 
   return contenders[0];
+}
+
+function hasSuit(cards: Card[], suit: Suit) {
+  return cards.some((card) => card.suit === suit);
 }
 
 function createMatch(players: PlayerSocket[]) {
@@ -549,6 +554,19 @@ wss.on("connection", (ws) => {
             d: { message: "Card not in hand" },
           });
           return;
+        }
+
+        if (match.tableCards.length > 0) {
+          const leadSuit = match.tableCards[0].card.suit;
+          const playerHasLeadSuit = hasSuit(hand, leadSuit);
+
+          if (playerHasLeadSuit && card.suit !== leadSuit) {
+            send(player, {
+              t: "ERROR",
+              d: { message: `You must follow suit: ${leadSuit}` },
+            });
+            return;
+          }
         }
 
         const [playedCard] = hand.splice(cardIndex, 1);
