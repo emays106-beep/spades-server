@@ -52,6 +52,8 @@ type TableCard = {
   card: Card;
 };
 
+type TeamKey = "NS" | "EW";
+
 type MatchState = {
   matchId: string;
   players: MatchPlayer[];
@@ -59,18 +61,22 @@ type MatchState = {
   tableCards: TableCard[];
   currentTurn: string;
   spadesBroken: boolean;
-  teamTricks: {
-    NS: number;
-    EW: number;
-  };
+  teamTricks: Record<TeamKey, number>;
   bids: Record<string, number | null>;
   biddingComplete: boolean;
   botTurnTimer?: NodeJS.Timeout | null;
   botBidTimer?: NodeJS.Timeout | null;
+  roundNumber: number;
+  completedTricks: number;
+  teamScores: Record<TeamKey, number>;
+  teamBags: Record<TeamKey, number>;
+  gameOver: boolean;
+  winnerTeam: TeamKey | null;
 };
 
 const TURN_ORDER = ["N", "E", "S", "W"] as const;
 const SEATS = ["N", "E", "S", "W"] as const;
+const WIN_SCORE = 500;
 
 const server = http.createServer((req, res) => {
   if (req.url === "/") {
@@ -293,7 +299,7 @@ function nextSeat(seat: string) {
   return TURN_ORDER[(index + 1) % TURN_ORDER.length];
 }
 
-function seatToTeam(seat: string) {
+function seatToTeam(seat: string): TeamKey {
   return seat === "N" || seat === "S" ? "NS" : "EW";
 }
 
@@ -403,48 +409,18 @@ function estimateBotBid(hand: Card[]) {
     }
   }
 
-  const rounded = Math.max(1, Math.min(13, Math.round(bid)));
-  return rounded;
+  return Math.max(1, Math.min(13, Math.round(bid)));
 }
 
-function teamBidTotal(match: MatchState, team: "NS" | "EW") {
+function teamBidTotal(match: MatchState, team: TeamKey) {
   const seats = team === "NS" ? ["N", "S"] : ["E", "W"];
   return seats.reduce((sum, seat) => sum + (match.bids[seat] ?? 0), 0);
 }
 
-function maybeCompleteBidding(match: MatchState) {
-  const allBid = SEATS.every((seat) => match.bids[seat] !== null);
-  if (!allBid || match.biddingComplete) return;
-
-  match.biddingComplete = true;
-  match.currentTurn = "N";
-
-  broadcastToMatch(match, {
-    t: "BIDDING_COMPLETE",
-    d: {
-      matchId: match.matchId,
-      bids: match.bids,
-      teamBids: {
-        NS: teamBidTotal(match, "NS"),
-        EW: teamBidTotal(match, "EW"),
-      },
-    },
-  });
-
-  broadcastToMatch(match, {
-    t: "TURN_UPDATE",
-    d: {
-      matchId: match.matchId,
-      currentTurn: match.currentTurn,
-      spadesBroken: match.spadesBroken,
-    },
-  });
-
-  scheduleBotTurnIfNeeded(match);
-}
-
 function scheduleBotBidIfNeeded(match: MatchState) {
   clearBotBidTimer(match);
+
+  if (match.gameOver) return;
 
   const nextBot = SEATS.find((seat) => {
     const player = findPlayerBySeat(match, seat);
@@ -458,7 +434,7 @@ function scheduleBotBidIfNeeded(match: MatchState) {
 
   match.botBidTimer = setTimeout(() => {
     const player = findPlayerBySeat(match, nextBot);
-    if (!player || !player.isBot) return;
+    if (!player || !player.isBot || match.gameOver) return;
 
     const hand = match.hands[player.playerId] ?? [];
     const bid = estimateBotBid(hand);
@@ -483,7 +459,7 @@ function scheduleBotBidIfNeeded(match: MatchState) {
 function scheduleBotTurnIfNeeded(match: MatchState) {
   clearBotTurnTimer(match);
 
-  if (!match.biddingComplete) return;
+  if (!match.biddingComplete || match.gameOver) return;
 
   const currentPlayer = findPlayerBySeat(match, match.currentTurn);
   if (!currentPlayer || !currentPlayer.isBot) return;
@@ -491,6 +467,166 @@ function scheduleBotTurnIfNeeded(match: MatchState) {
   match.botTurnTimer = setTimeout(() => {
     playBotTurn(match.matchId);
   }, 900);
+}
+
+function calculateRoundScore(
+  teamBid: number,
+  teamTricks: number,
+  currentBags: number,
+) {
+  let scoreDelta = 0;
+  let bags = currentBags;
+
+  if (teamTricks >= teamBid) {
+    const extra = teamTricks - teamBid;
+    scoreDelta += teamBid * 10 + extra;
+    bags += extra;
+
+    if (bags >= 10) {
+      scoreDelta -= 100;
+      bags -= 10;
+    }
+  } else {
+    scoreDelta -= teamBid * 10;
+  }
+
+  return {
+    scoreDelta,
+    bags,
+  };
+}
+
+function checkGameOver(match: MatchState) {
+  if (match.teamScores.NS >= WIN_SCORE || match.teamScores.EW >= WIN_SCORE) {
+    match.gameOver = true;
+    match.winnerTeam =
+      match.teamScores.NS >= WIN_SCORE && match.teamScores.EW >= WIN_SCORE
+        ? match.teamScores.NS >= match.teamScores.EW
+          ? "NS"
+          : "EW"
+        : match.teamScores.NS >= WIN_SCORE
+          ? "NS"
+          : "EW";
+
+    clearBotBidTimer(match);
+    clearBotTurnTimer(match);
+
+    broadcastToMatch(match, {
+      t: "GAME_OVER",
+      d: {
+        matchId: match.matchId,
+        winnerTeam: match.winnerTeam,
+        totalScores: match.teamScores,
+        bags: match.teamBags,
+      },
+    });
+
+    return true;
+  }
+
+  return false;
+}
+
+function resetForNextRound(match: MatchState) {
+  clearBotBidTimer(match);
+  clearBotTurnTimer(match);
+
+  if (match.gameOver) return;
+
+  const newHands = dealHands(match.players);
+
+  match.hands = newHands;
+  match.tableCards = [];
+  match.currentTurn = "N";
+  match.spadesBroken = false;
+  match.teamTricks = { NS: 0, EW: 0 };
+  match.bids = { N: null, E: null, S: null, W: null };
+  match.biddingComplete = false;
+  match.roundNumber += 1;
+  match.completedTricks = 0;
+
+  for (const player of match.players) {
+    if (!player.isBot && player.ws) {
+      send(player.ws, {
+        t: "NEW_ROUND",
+        d: {
+          matchId: match.matchId,
+          roundNumber: match.roundNumber,
+          currentTurn: match.currentTurn,
+          spadesBroken: match.spadesBroken,
+          teamScores: match.teamScores,
+          teamBags: match.teamBags,
+        },
+      });
+
+      send(player.ws, {
+        t: "HAND_DEALT",
+        d: {
+          matchId: match.matchId,
+          seat: player.seat,
+          hand: newHands[player.playerId] ?? [],
+          currentTurn: match.currentTurn,
+          spadesBroken: match.spadesBroken,
+        },
+      });
+
+      send(player.ws, {
+        t: "BID_REQUEST",
+        d: {
+          matchId: match.matchId,
+          seat: player.seat,
+        },
+      });
+    }
+  }
+
+  broadcastToMatch(match, {
+    t: "BID_STATUS",
+    d: {
+      matchId: match.matchId,
+      bids: match.bids,
+    },
+  });
+
+  scheduleBotBidIfNeeded(match);
+}
+
+function completeRound(match: MatchState) {
+  const nsBid = teamBidTotal(match, "NS");
+  const ewBid = teamBidTotal(match, "EW");
+
+  const nsResult = calculateRoundScore(nsBid, match.teamTricks.NS, match.teamBags.NS);
+  const ewResult = calculateRoundScore(ewBid, match.teamTricks.EW, match.teamBags.EW);
+
+  match.teamScores.NS += nsResult.scoreDelta;
+  match.teamScores.EW += ewResult.scoreDelta;
+
+  match.teamBags.NS = nsResult.bags;
+  match.teamBags.EW = ewResult.bags;
+
+  broadcastToMatch(match, {
+    t: "ROUND_COMPLETE",
+    d: {
+      matchId: match.matchId,
+      roundNumber: match.roundNumber,
+      bids: match.bids,
+      tricks: match.teamTricks,
+      roundScores: {
+        NS: nsResult.scoreDelta,
+        EW: ewResult.scoreDelta,
+      },
+      totalScores: match.teamScores,
+      bags: match.teamBags,
+    },
+  });
+
+  if (checkGameOver(match)) {
+    return;
+  }
+
+  setTimeout(() => {
+    resetForNextRound(match);
+  }, 2200);
 }
 
 function finishTrickIfReady(match: MatchState) {
@@ -504,6 +640,7 @@ function finishTrickIfReady(match: MatchState) {
   const winnerTeam = seatToTeam(winner.seat);
   match.teamTricks[winnerTeam] += 1;
   match.currentTurn = winner.seat;
+  match.completedTricks += 1;
 
   broadcastToMatch(match, {
     t: "TRICK_COMPLETE",
@@ -535,6 +672,11 @@ function finishTrickIfReady(match: MatchState) {
     },
   });
 
+  if (match.completedTricks >= 13) {
+    completeRound(match);
+    return;
+  }
+
   scheduleBotTurnIfNeeded(match);
 }
 
@@ -546,6 +688,10 @@ function playValidatedCard(
 ) {
   if (!match.biddingComplete) {
     return { ok: false, error: "Bidding is not complete" as const };
+  }
+
+  if (match.gameOver) {
+    return { ok: false, error: "Game is over" as const };
   }
 
   const hand = match.hands[playerId] ?? [];
@@ -614,7 +760,7 @@ function playValidatedCard(
 
 function playBotTurn(matchId: string) {
   const match = matches.get(matchId);
-  if (!match) return;
+  if (!match || match.gameOver) return;
 
   clearBotTurnTimer(match);
 
@@ -630,6 +776,37 @@ function playBotTurn(matchId: string) {
   if (!chosen) return;
 
   playValidatedCard(match, bot.playerId, bot.seat, chosen);
+}
+
+function maybeCompleteBidding(match: MatchState) {
+  const allBid = SEATS.every((seat) => match.bids[seat] !== null);
+  if (!allBid || match.biddingComplete) return;
+
+  match.biddingComplete = true;
+  match.currentTurn = "N";
+
+  broadcastToMatch(match, {
+    t: "BIDDING_COMPLETE",
+    d: {
+      matchId: match.matchId,
+      bids: match.bids,
+      teamBids: {
+        NS: teamBidTotal(match, "NS"),
+        EW: teamBidTotal(match, "EW"),
+      },
+    },
+  });
+
+  broadcastToMatch(match, {
+    t: "TURN_UPDATE",
+    d: {
+      matchId: match.matchId,
+      currentTurn: match.currentTurn,
+      spadesBroken: match.spadesBroken,
+    },
+  });
+
+  scheduleBotTurnIfNeeded(match);
 }
 
 function createMatch(players: PlayerSocket[]) {
@@ -660,6 +837,18 @@ function createMatch(players: PlayerSocket[]) {
     biddingComplete: false,
     botTurnTimer: null,
     botBidTimer: null,
+    roundNumber: 1,
+    completedTricks: 0,
+    teamScores: {
+      NS: 0,
+      EW: 0,
+    },
+    teamBags: {
+      NS: 0,
+      EW: 0,
+    },
+    gameOver: false,
+    winnerTeam: null,
   };
 
   matches.set(matchId, match);
@@ -853,6 +1042,14 @@ wss.on("connection", (ws) => {
           send(player, {
             t: "ERROR",
             d: { message: "Match not found" },
+          });
+          return;
+        }
+
+        if (match.gameOver) {
+          send(player, {
+            t: "ERROR",
+            d: { message: "Game is already over" },
           });
           return;
         }
